@@ -8,8 +8,8 @@ A simple interactive 3D operation demo implemented with DearPyGui
 
 ### Guidance
 - You can choose one of two modes:
-  1. Drag and contiguous move.
-  2. (Recommanded!) Drag and move only when the mouse is moving.
+  1. Drag and contiguous move/rotate.
+  2. (Recommended!) Drag and move/rotate only when the mouse is moving.
 
 ### TODO
 - Add more buttons, slides, and links for better using experience.
