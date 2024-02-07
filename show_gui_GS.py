@@ -71,11 +71,7 @@ class OrbitCamera:
         self.scale_f = 1.0
 
 
-        self.mode = 1
-        if self.mode == 1:
-            self.pose = self.pose_movecenter
-        elif self.mode == 2:
-            self.pose = self.pose_objcenter
+        self.rot_mode = 1   # rotation mode (1: self.pose_movecenter, 2: self.pose_objcenter)
 
 
     @property
@@ -142,10 +138,10 @@ class OrbitCamera:
         return np.array([focal, focal, self.W // 2, self.H // 2])
 
     def orbit(self, dx, dy):
-        if self.mode == 1:    # rotate the camera axis, in world coordinate system
+        if self.rot_mode == 1:    # rotate the camera axis, in world coordinate system
             up = self.rot.as_matrix()[:3, 1]
             side = self.rot.as_matrix()[:3, 0]
-        elif self.mode == 2:    # rotate in camera coordinate system
+        elif self.rot_mode == 0:    # rotate in camera coordinate system
             up = -self.up
             side = -self.right
         rotvec_x = up * np.radians(0.01 * dx)
@@ -159,10 +155,10 @@ class OrbitCamera:
 
     def pan(self, dx, dy, dz=0):
         
-        if self.mode == 1:
+        if self.rot_mode == 1:
             # pan in camera coordinate system: project from [Coord_c] to [Coord_w]
             self.center += 0.0005 * self.rot.as_matrix()[:3, :3] @ np.array([dx, -dy, dz])
-        elif self.mode == 2:
+        elif self.rot_mode == 0:
             # pan in world coordinate system: at [Coord_w]
             self.center += 0.0005 * np.array([-dx, dy, dz])
 
@@ -209,113 +205,123 @@ class GaussianSplattingGUI:
         self.moving_middle = False
         self.mouse_pos = (0, 0)
 
+        # --- for interactive segmentation --- #
+        self.img_mode = 0
+        self.clickmode_button = False
+        self.clickmode_multi_button = False     # choose multiple object 
+        self.new_click = False
+        self.prompt_num = 0
+        self.new_click_xy = []
+        self.clear_edit = False
+        self.binary_threshold_button = False
+
     def __del__(self):
         dpg.destroy_context()
 
     def prepare_buffer(self, outputs):
         if self.model == "images":
             return outputs["render"]
-
         else:
             return np.expand_dims(outputs["depth"], -1).repeat(3, -1)
 
     def register_dpg(self):
+        
         ### register texture
-
         with dpg.texture_registry(show=False):
-            dpg.add_raw_texture(
-                self.width,
-                self.height,
-                self.render_buffer,
-                format=dpg.mvFormat_Float_rgb,
-                tag="_texture",
-            )
+            dpg.add_raw_texture(self.width, self.height, self.render_buffer, format=dpg.mvFormat_Float_rgb, tag="_texture")
 
         ### register window
-
-        with dpg.window(
-            tag="_primary_window", width=self.window_width, height=self.window_height
-        ):
-            # add the texture
-            dpg.add_image("_texture")
+        with dpg.window(tag="_primary_window", width=self.window_width+400, height=self.window_height):
+            dpg.add_image("_texture")   # add the texture
 
         dpg.set_primary_window("_primary_window", True)
 
+        def callback_depth(sender, app_data):
+            self.img_mode = (self.img_mode + 1) % 3
+            
+        # --- interactive mode switch --- #
+        def clickmode_callback(sender):
+            self.clickmode_button = 1 - self.clickmode_button
+        def clickmode_multi_callback(sender):
+            self.clickmode_multi_button = dpg.get_value(sender)
+            print("clickmode_multi_button = ", self.clickmode_multi_button)
+        def binary_threshold_callback(sender):
+            self.binary_threshold_button = dpg.get_value(sender)
+            print("binary_threshold_button = ", self.binary_threshold_button)
+        def clear_edit():
+            self.clear_edit = True
+
         # control window
-        with dpg.window(label="Control", tag="_control_window", width=400, height=300):
+        with dpg.window(label="Control", tag="_control_window", width=400, height=300, pos=[self.window_width, 0]):
+            
+            dpg.add_slider_float(label="ScoreThres", default_value=0.0,
+                                 min_value=0.0, max_value=1.0, tag="_ScoreThres")
+            dpg.add_button(label="show depth", tag="_button_depth",
+                            callback=callback_depth)
+            dpg.add_text("Mouse position: click anywhere to start. ", tag="pos_item")
+            dpg.add_checkbox(label="clickmode", callback=clickmode_callback, user_data="Some Data")
+            dpg.add_checkbox(label="multi-clickmode", callback=clickmode_multi_callback, user_data="Some Data")
+            dpg.add_checkbox(label="binary_threshold", callback=binary_threshold_callback, user_data="Some Data")
+            dpg.add_button(label="clear_edit", callback=clear_edit, user_data="Some Data")
 
             # rendering options
-            with dpg.collapsing_header(label="Options", default_open=True):
-                # dynamic rendering resolution
-                with dpg.group(horizontal=True):
+            # with dpg.collapsing_header(label="Options", default_open=True, show=False):
+            # dynamic rendering resolution
+            with dpg.group(horizontal=True):
 
-                    def callback_set_dynamic_resolution(sender, app_data):
-                        if self.dynamic_resolution:
-                            self.dynamic_resolution = False
-                        else:
-                            self.dynamic_resolution = True
-                        self.need_update = True
+                def callback_set_dynamic_resolution(sender, app_data):
+                    self.dynamic_resolution = 1 - self.dynamic_resolution
+                    self.need_update = True
+                dpg.add_checkbox( label="dynamic resolution", default_value=self.dynamic_resolution, callback=callback_set_dynamic_resolution)
+                dpg.add_text(f"{self.width}x{self.height}", tag="_log_resolution")
 
-                    dpg.add_checkbox(
-                        label="dynamic resolution",
-                        default_value=self.dynamic_resolution,
-                        callback=callback_set_dynamic_resolution,
-                    )
-                    dpg.add_text(f"{self.width}x{self.height}", tag="_log_resolution")
+            def callback(sender, app_data, user_data):
+                self.load_model = False
+                file_data = app_data["selections"]
+                file_names = []
+                for key in file_data.keys():
+                    file_names.append(key)
 
-                def callback(sender, app_data, user_data):
-                    self.load_model = False
-                    file_data = app_data["selections"]
-                    file_names = []
-                    for key in file_data.keys():
-                        file_names.append(key)
+                self.ply_file = file_data[file_names[0]]
 
-                    self.ply_file = file_data[file_names[0]]
+                # if not self.load_model:
+                print("loading model file...")
+                self.engine.load_ply(self.ply_file)
+                self.do_pca()   # calculate new self.proj_mat after loading new .ply file
+                print("loading model file done.")
+                self.load_model = True
 
-                    # if not self.load_model:
-                    print("loading model file...")
-                    self.engine.load_ply(self.ply_file)
-                    self.do_pca()   # calculate new self.proj_mat after loading new .ply file
-                    print("loading model file done.")
-                    self.load_model = True
+            with dpg.file_dialog(directory_selector=False, show=False, callback=callback, id="file_dialog_id", width=700, height=400,
+            ):
+                dpg.add_file_extension(".*")
+                dpg.add_file_extension("", color=(150, 255, 150, 255))
+                dpg.add_file_extension("Ply (*.ply){.ply}", color=(0, 255, 255, 255))
+            dpg.add_button(label="File Selector", callback=lambda: dpg.show_item("file_dialog_id"))
 
-                with dpg.file_dialog(directory_selector=False, show=False, callback=callback, id="file_dialog_id", width=700, height=400,
-                ):
-                    dpg.add_file_extension(".*")
-                    dpg.add_file_extension("", color=(150, 255, 150, 255))
-                    dpg.add_file_extension(
-                        "Ply (*.ply){.ply}", color=(0, 255, 255, 255)
-                    )
-                dpg.add_button(label="File Selector", callback=lambda: dpg.show_item("file_dialog_id"))
+            # mode combo
+            def callback_change_mode(sender, app_data):
+                self.mode = app_data
+                self.update_camera = True
+            dpg.add_combo(("image", "depth"), label="mode", default_value=self.mode, callback=callback_change_mode)
 
-                # mode combo
-                def callback_change_mode(sender, app_data):
-                    self.mode = app_data
-                    self.update_camera = True
+            # bg_color picker
+            def callback_change_bg(sender, app_data):
+                self.bg_color = torch.tensor(app_data[:3], dtype=torch.float32)  # only need RGB in [0, 1]
+                self.update_camera = True
+            dpg.add_color_edit((255, 255, 255), label="Background Color", width=200, tag="_color_editor", no_alpha=True, 
+                                callback=callback_change_bg)
 
-                dpg.add_combo(("image", "depth"), label="mode", default_value=self.mode, callback=callback_change_mode)
+            def callback_set_fovy(sender, app_data):
+                self.camera.fovy = app_data
+                self.update_camera = True
+            dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, format="%d deg", default_value=self.camera.fovy,
+                                callback=callback_set_fovy,)
 
-                # bg_color picker
-                def callback_change_bg(sender, app_data):
-                    self.bg_color = torch.tensor(app_data[:3], dtype=torch.float32)  # only need RGB in [0, 1]
-                    self.update_camera = True
-
-                dpg.add_color_edit((255, 255, 255), label="Background Color", width=200, tag="_color_editor", no_alpha=True, 
-                                   callback=callback_change_bg)
-
-                def callback_set_fovy(sender, app_data):
-                    self.camera.fovy = app_data
-                    self.update_camera = True
-
-                dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, format="%d deg", default_value=self.camera.fovy,
-                                   callback=callback_set_fovy,)
-
-                def callback_set_dt_gamma(sender, app_data):
-                    self.opt.dt_gamma = app_data
-                    self.update_camera = True
-
-                dpg.add_slider_float(label="dt_gamma", min_value=0, max_value=0.1, format="%.5f", default_value=self.opt.dt_gamma,
-                                     callback=callback_set_dt_gamma)
+            def callback_set_dt_gamma(sender, app_data):
+                self.opt.dt_gamma = app_data
+                self.update_camera = True
+            dpg.add_slider_float(label="dt_gamma", min_value=0, max_value=0.1, format="%.5f", default_value=self.opt.dt_gamma,
+                                    callback=callback_set_dt_gamma)
 
         if self.debug:
             with dpg.collapsing_header(label="Debug"):
@@ -377,6 +383,15 @@ class GaussianSplattingGUI:
             self.mouse_pos = pos
 
 
+        def change_pos(sender, app_data):
+            xy = dpg.get_mouse_pos(local=False)
+            dpg.set_value("pos_item", f"Mouse position = ({xy[0]}, {xy[1]})")
+            if self.clickmode_button and app_data == 1:     # in the click mode and right click
+                print(xy)
+                self.new_click_xy = np.array(xy)
+                self.new_click = True
+
+
         with dpg.handler_registry():
             # dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             # dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
@@ -388,12 +403,10 @@ class GaussianSplattingGUI:
             dpg.add_mouse_release_handler(dpg.mvMouseButton_Middle, callback=lambda:toggle_moving_middle())
             dpg.add_mouse_move_handler(callback=lambda s, a, u:move_handler(s, a, u))
             
-        dpg.create_viewport(
-            title="Gaussian-Splatting-Viewer",
-            width=self.window_width,
-            height=self.window_height,
-            resizable=False,
-        )
+            dpg.add_mouse_click_handler(callback=change_pos)
+            
+        dpg.create_viewport(title="Gaussian-Splatting-Viewer", width=self.window_width+400, height=self.window_height, resizable=False)
+
         ### global theme
         with dpg.theme() as theme_no_padding:
             with dpg.theme_component(dpg.mvAll):
@@ -421,8 +434,13 @@ class GaussianSplattingGUI:
     ) -> Camera:
         # R = self.camera.opt_pose[:3, :3]
         # t = self.camera.opt_pose[:3, 3]
-        R = self.camera.pose[:3, :3]
-        t = self.camera.pose[:3, 3]
+        if self.camera.rot_mode == 1:
+            pose = self.camera.pose_movecenter
+        elif self.camera.rot_mode == 0:
+            pose = self.camera.pose_objcenter
+
+        R = pose[:3, :3]
+        t = pose[:3, 3]
 
         ss = math.pi / 180.0
         fovy = self.camera.fovy * ss
@@ -475,21 +493,68 @@ class GaussianSplattingGUI:
         outputs = render(view_camera, self.engine, self.opt, self.bg_color)
 
         # --- RGB image --- #
-        # img = outputs["render"].permute(1, 2, 0)  #
+        img = outputs["render"].permute(1, 2, 0)  #
         # img = img.detach().cpu().numpy()
-        # # img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        # img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         # img = img.reshape(-1)
-        # self.render_buffer = img
+        rgb_score = img.clone()
         # print(img.max(), img.min())
 
         # --- semantic image --- #
         sems = outputs["render_object"].permute(1, 2, 0)
+        H, W, C = sems.shape
         sems /= (torch.norm(sems, dim=-1, keepdim=True) + 1e-6)
         sem_transed = sems @ self.proj_mat
         sem_transed_rgb = torch.clip(sem_transed*0.5+0.5, 0, 1)
-        self.render_buffer = sem_transed_rgb.cpu().numpy()
         # print(sem_transed_rgb.max(), sem_transed_rgb.min())
 
+        if self.clear_edit:
+            self.new_click_xy = []
+            self.clear_edit = False
+            self.prompt_num = 0
+
+        if len(self.new_click_xy) > 0:
+
+            featmap = sems.reshape(H, W, -1)
+            
+            if self.new_click:
+                xy = self.new_click_xy
+                new_feat = featmap[int(xy[1])%H, int(xy[0])%W, :].reshape(featmap.shape[-1], -1)
+                # new_xyz = xyz_map[int(xy[1])%H, int(xy[0])%W, :].reshape(1, 3)
+                if (self.prompt_num == 0) or (self.clickmode_multi_button == False):
+                    self.chosen_feature = new_feat
+                    # self.chosen_xyz = new_xyz
+                else:
+                    self.chosen_feature = torch.cat([self.chosen_feature, new_feat], dim=-1)    # extend to get more prompt features
+                    # self.chosen_xyz = torch.cat([self.chosen_xyz, new_xyz], dim=0)
+                self.prompt_num += 1
+                self.new_click = False
+            
+            score_map = featmap @ self.chosen_feature
+            # if W_XYZ > 0: score_map *= torch.cdist(xyz_map, self.chosen_xyz[None, :, :]).mul_(-W_XYZ).exp_()
+
+            score_map = (score_map + 1.0) / 2
+            score_binary = score_map > dpg.get_value('_ScoreThres')
+            
+            score_map[~score_binary] = 0.0
+            score_map = torch.max(score_map, dim=-1).values
+            score_norm = (score_map - dpg.get_value('_ScoreThres')) / (1 - dpg.get_value('_ScoreThres'))
+
+
+            if self.binary_threshold_button:
+                rgb_score = img * torch.max(score_binary, dim=-1, keepdim=True).values    # option: binary
+            else:
+                rgb_score = img * score_norm[:, :, None]
+                # rgb_score = rgb * score_map[:, :, None]
+            depth_score = 1 - torch.clip(score_norm, 0, 1)
+
+        if self.img_mode == 0:
+            self.render_buffer = rgb_score.cpu().numpy().reshape(-1)
+        elif self.img_mode == 1:
+            self.render_buffer = rgb_score.cpu().numpy().reshape(-1)
+        elif self.img_mode == 2:
+            self.render_buffer = sem_transed_rgb.cpu().numpy()
+        
         dpg.set_value("_texture", self.render_buffer)
 
 
